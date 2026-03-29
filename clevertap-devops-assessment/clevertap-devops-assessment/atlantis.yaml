@@ -1,0 +1,138 @@
+# =============================================================================
+# Atlantis Server-Side Repo Config
+# atlantis.yaml — checked into repo root
+# =============================================================================
+# Atlantis enforces:
+#   - Which GitHub teams can plan/apply which environments
+#   - Separate workspaces per environment/region (maps to separate state files)
+#   - Required reviewers before apply is permitted
+#   - Drift detection via scheduled plan runs (see .github/workflows/drift.yml)
+#
+# RBAC MODEL:
+#   owners (platform-leads)  → can apply prod
+#   contributors (platform)  → can apply staging
+#   readers (product-teams)  → can plan any env, cannot apply
+# =============================================================================
+
+version: 3
+
+automerge: false
+delete_source_branch_on_merge: false
+
+projects:
+  # -----------------------------------------------------------------------
+  # Production — us-east-1
+  # -----------------------------------------------------------------------
+  - name: prod-us-east-1-vpc
+    dir: terraform/environments/prod/us-east-1
+    workspace: vpc
+    terraform_version: v1.7.0
+    autoplan:
+      when_modified:
+        - "*.tf"
+        - "../../../modules/vpc/**/*.tf"
+      enabled: true
+    apply_requirements:
+      - approved         # At least 1 approving review
+      - mergeable        # No outstanding change requests
+      - undiverged       # Branch must be up-to-date with base
+    allowed_owners:
+      - "clevertap/platform-leads"   # Only platform-leads can apply prod
+
+  - name: prod-us-east-1-eks
+    dir: terraform/environments/prod/us-east-1
+    workspace: eks
+    terraform_version: v1.7.0
+    autoplan:
+      when_modified:
+        - "*.tf"
+        - "../../../modules/eks/**/*.tf"
+      enabled: true
+    apply_requirements:
+      - approved
+      - mergeable
+      - undiverged
+    allowed_owners:
+      - "clevertap/platform-leads"
+
+  # -----------------------------------------------------------------------
+  # Production — ap-south-1
+  # -----------------------------------------------------------------------
+  - name: prod-ap-south-1-vpc
+    dir: terraform/environments/prod/ap-south-1
+    workspace: vpc
+    terraform_version: v1.7.0
+    autoplan:
+      when_modified:
+        - "*.tf"
+        - "../../../modules/vpc/**/*.tf"
+      enabled: true
+    apply_requirements:
+      - approved
+      - mergeable
+      - undiverged
+    allowed_owners:
+      - "clevertap/platform-leads"
+
+  - name: prod-ap-south-1-eks
+    dir: terraform/environments/prod/ap-south-1
+    workspace: eks
+    terraform_version: v1.7.0
+    autoplan:
+      when_modified:
+        - "*.tf"
+        - "../../../modules/eks/**/*.tf"
+      enabled: true
+    apply_requirements:
+      - approved
+      - mergeable
+      - undiverged
+    allowed_owners:
+      - "clevertap/platform-leads"
+
+  # -----------------------------------------------------------------------
+  # Staging — any engineer with contributor role can apply
+  # -----------------------------------------------------------------------
+  - name: staging-us-east-1
+    dir: terraform/environments/staging/us-east-1
+    workspace: default
+    terraform_version: v1.7.0
+    autoplan:
+      when_modified:
+        - "**/*.tf"
+      enabled: true
+    apply_requirements:
+      - approved
+    allowed_owners:
+      - "clevertap/platform-leads"
+      - "clevertap/platform-engineers"   # Broader team can apply staging
+
+  # -----------------------------------------------------------------------
+  # Dev — any engineer can self-serve
+  # -----------------------------------------------------------------------
+  - name: dev-us-east-1
+    dir: terraform/environments/dev/us-east-1
+    workspace: default
+    terraform_version: v1.7.0
+    autoplan:
+      when_modified:
+        - "**/*.tf"
+      enabled: true
+    apply_requirements: []   # No approval required for dev
+    allowed_owners:
+      - "clevertap/platform-leads"
+      - "clevertap/platform-engineers"
+      - "clevertap/product-engineers"    # Product teams self-serve dev
+
+# =============================================================================
+# Drift Detection Workflow (referenced by .github/workflows/drift.yml)
+# =============================================================================
+# Schedule: daily at 02:00 UTC (off-peak for both US and IN regions)
+# Action: atlantis plan --verbose for each project above.
+#         If exit code 2 (changes detected), post diff to #terraform-drift Slack
+#         and open Jira ticket: [DRIFT] {project-name} {date}
+#
+# Remediation triage (see docs/assessment-written.md §1b):
+#   1. Is this a hotfix that should be imported into state? → terraform import
+#   2. Is this unauthorized? → revert + security escalation
+#   3. Is this click-ops debt? → schedule terraform import sprint

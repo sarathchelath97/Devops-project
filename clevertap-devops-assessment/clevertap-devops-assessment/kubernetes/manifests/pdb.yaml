@@ -1,0 +1,91 @@
+# =============================================================================
+# Pod Disruption Budgets (PDBs)
+# =============================================================================
+# PDBs are the guardrail that makes Spot nodes safe for production workloads.
+#
+# Without PDBs: a Spot interruption or cluster upgrade drains multiple nodes
+# simultaneously, potentially evicting ALL pods of a service at once.
+#
+# With PDBs: the Kubernetes eviction API blocks node drain if doing so would
+# violate the budget — the drain waits for new pods to schedule first.
+#
+# SIZING RULES applied here:
+#   minAvailable = 50% for stateless services — allows rolling drain while
+#   keeping half the fleet serving traffic. For critical services (event
+#   ingestion, campaign delivery) we use 75% to match our 99.9% SLA budget.
+#
+#   Never set minAvailable = 100% — this blocks ALL voluntary evictions
+#   (upgrades, drains) and causes cluster operations to hang indefinitely.
+# =============================================================================
+
+---
+# Event ingestion: 75% min available (P0 service — feeds Kafka)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: event-ingestion-service-pdb
+  namespace: event-ingestion
+  labels:
+    app: event-ingestion-service
+    managed-by: helm
+spec:
+  minAvailable: "75%"
+  selector:
+    matchLabels:
+      app: event-ingestion-service
+
+---
+# Campaign delivery: 75% min available (direct customer impact)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: campaign-delivery-service-pdb
+  namespace: campaign-delivery
+spec:
+  minAvailable: "75%"
+  selector:
+    matchLabels:
+      app: campaign-delivery-service
+
+---
+# Analytics API: 50% min available (stateless, tolerates brief degraded capacity)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: analytics-api-pdb
+  namespace: analytics
+spec:
+  minAvailable: "50%"
+  selector:
+    matchLabels:
+      app: analytics-api
+
+---
+# Kafka consumers: maxUnavailable=1 (absolute count, not percent)
+# WHY: Consumers maintain partition assignments. Losing >1 simultaneously
+# causes partition rebalance storms. maxUnavailable=1 ensures at most one
+# consumer rebalances at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-consumer-pdb
+  namespace: event-ingestion
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: event-ingestion-kafka-consumer
+
+---
+# CoreDNS: must keep at least 1 replica at all times
+# (EKS managed addon — this PDB supplements EKS's own replica management)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coredns-pdb
+  namespace: kube-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
