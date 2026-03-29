@@ -1,0 +1,195 @@
+# =============================================================================
+# Argo Rollouts — Canary Deployment for event-ingestion-service
+# =============================================================================
+# Strategy: 10% → 50% → 100% with automated analysis at each step.
+# Rollback triggers: error rate > 1% OR p99 latency > 500ms OR manual abort.
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: event-ingestion-service
+  namespace: event-ingestion
+  labels:
+    app: event-ingestion-service
+    team: platform
+spec:
+  replicas: 20  # Scales with HPA; this is the base
+  selector:
+    matchLabels:
+      app: event-ingestion-service
+  template:
+    metadata:
+      labels:
+        app: event-ingestion-service
+    spec:
+      serviceAccountName: event-ingestion-service  # IRSA-bound SA
+      terminationGracePeriodSeconds: 60
+
+      # Spread across AZs and nodes for HA
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: event-ingestion-service
+
+      containers:
+        - name: event-ingestion-service
+          image: 123456789.dkr.ecr.us-east-1.amazonaws.com/event-ingestion-service:PLACEHOLDER
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 1Gi  # No CPU limit — avoid throttling; rely on requests for scheduling
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Secrets injected via External Secrets Operator — NOT env vars with values
+          envFrom:
+            - secretRef:
+                name: event-ingestion-service-secrets  # Synced from AWS Secrets Manager by ESO
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: KAFKA_TOPIC
+              value: "campaign-events-prod"
+
+  strategy:
+    canary:
+      # Traffic is managed by the canary-service / stable-service selector split
+      canaryService: event-ingestion-service-canary
+      stableService: event-ingestion-service-stable
+
+      # Istio or ALB for weighted traffic splitting
+      trafficRouting:
+        alb:
+          ingress: event-ingestion-service-ingress
+          servicePort: 80
+          annotationPrefix: alb.ingress.kubernetes.io
+
+      steps:
+        # Step 1: 10% canary traffic
+        - setWeight: 10
+        - pause:
+            duration: 2m  # Bake time before analysis
+
+        # Analysis at 10%: error rate + latency
+        - analysis:
+            templates:
+              - templateName: canary-analysis
+            args:
+              - name: service-name
+                value: event-ingestion-service-canary
+
+        # Step 2: 50% if analysis passed
+        - setWeight: 50
+        - pause:
+            duration: 5m
+
+        - analysis:
+            templates:
+              - templateName: canary-analysis
+            args:
+              - name: service-name
+                value: event-ingestion-service-canary
+
+        # Step 3: 100% — full rollout
+        - setWeight: 100
+
+      # Rollback: on analysis failure or manual abort, shift 100% back to stable
+      autoPromotionEnabled: false  # Require each step to explicitly pass analysis
+
+---
+# =============================================================================
+# AnalysisTemplate — defines automated rollback criteria
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-analysis
+  namespace: event-ingestion
+spec:
+  args:
+    - name: service-name
+
+  metrics:
+    # Metric 1: HTTP error rate < 1%
+    - name: error-rate
+      interval: 30s
+      count: 5       # Run 5 measurements
+      successCondition: result[0] < 0.01
+      failureLimit: 1  # Fail immediately on first bad measurement
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(http_requests_total{
+              service="{{args.service-name}}",
+              status=~"5.."
+            }[2m])) /
+            sum(rate(http_requests_total{
+              service="{{args.service-name}}"
+            }[2m]))
+
+    # Metric 2: p99 latency < 500ms
+    - name: p99-latency
+      interval: 30s
+      count: 5
+      successCondition: result[0] < 500
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_milliseconds_bucket{
+                service="{{args.service-name}}"
+              }[2m])) by (le)
+            )
+
+    # Metric 3: Kafka consumer lag not increasing
+    - name: kafka-consumer-lag
+      interval: 60s
+      count: 3
+      successCondition: result[0] < 10000  # Max acceptable lag
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            kafka_consumer_group_lag{
+              group="event-ingestion-service",
+              topic="campaign-events-prod"
+            }

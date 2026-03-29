@@ -1,0 +1,256 @@
+# =============================================================================
+# Staging Promotion Pipeline
+# =============================================================================
+# Triggered manually or on merge to main after the PR pipeline succeeds.
+# Stages:
+#   1. Deploy to staging via Helm
+#   2. Automated smoke tests
+#   3. Manual approval gate before production
+# Secrets: injected at runtime via External Secrets Operator (no YAML secrets)
+# =============================================================================
+
+name: Staging Promotion
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full ECR image tag to promote (defaults to latest main build)"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+  deployments: write
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  SERVICE_NAME: event-ingestion-service
+  STAGING_CLUSTER: clevertap-staging-use1
+  STAGING_NAMESPACE: event-ingestion
+  HELM_CHART_PATH: ./kubernetes/helm/event-ingestion-service
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Resolve the image tag to promote
+  # ---------------------------------------------------------------------------
+  resolve-image:
+    name: Resolve Image Tag
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      full_image: ${{ steps.resolve.outputs.full_image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GithubActionsReadECR
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve image tag
+        id: resolve
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            IMAGE_TAG="${{ inputs.image_tag }}"
+          else
+            # Use commit SHA of the triggering push
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+            IMAGE_TAG="${{ env.SERVICE_NAME }}:main-${SHORT_SHA}"
+          fi
+          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Promoting image: ${FULL_IMAGE}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Deploy to Staging
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: resolve-image
+    environment:
+      name: staging
+      url: https://staging.clevertap.internal/${{ env.SERVICE_NAME }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GithubActionsDeployStaging
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for staging cluster
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.STAGING_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Helm lint
+        run: |
+          helm lint ${{ env.HELM_CHART_PATH }} \
+            --values ${{ env.HELM_CHART_PATH }}/values-staging.yaml
+
+      - name: Helm upgrade --install (staging)
+        run: |
+          helm upgrade --install ${{ env.SERVICE_NAME }} \
+            ${{ env.HELM_CHART_PATH }} \
+            --namespace ${{ env.STAGING_NAMESPACE }} \
+            --create-namespace \
+            --values ${{ env.HELM_CHART_PATH }}/values-staging.yaml \
+            --set image.repository=${{ env.ECR_REGISTRY }}/${{ env.SERVICE_NAME }} \
+            --set image.tag=$(echo "${{ needs.resolve-image.outputs.image_tag }}" | cut -d: -f2) \
+            --set deploymentAnnotations."deploy\.clevertap\.io/commit"=${{ github.sha }} \
+            --set deploymentAnnotations."deploy\.clevertap\.io/pipeline"=${{ github.run_id }} \
+            --wait \
+            --timeout 5m \
+            --atomic  # Auto-rollback on failure
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Smoke Tests
+  # ---------------------------------------------------------------------------
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GithubActionsDeployStaging
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.STAGING_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/${{ env.SERVICE_NAME }} \
+            -n ${{ env.STAGING_NAMESPACE }} \
+            --timeout=3m
+
+      - name: Health check — readiness probe
+        run: |
+          # Port-forward to the service and hit the health endpoint
+          kubectl port-forward svc/${{ env.SERVICE_NAME }} 8080:80 \
+            -n ${{ env.STAGING_NAMESPACE }} &
+          PF_PID=$!
+          sleep 3
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:8080/health/ready)
+
+          kill $PF_PID
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Health check failed with HTTP $HTTP_STATUS"
+            exit 1
+          fi
+          echo "Health check passed (HTTP $HTTP_STATUS)"
+
+      - name: API smoke test — event ingestion endpoint
+        run: |
+          kubectl port-forward svc/${{ env.SERVICE_NAME }} 8080:80 \
+            -n ${{ env.STAGING_NAMESPACE }} &
+          PF_PID=$!
+          sleep 3
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST http://localhost:8080/v1/events \
+            -H "Content-Type: application/json" \
+            -d '{"type":"smoke_test","account_id":"smoke-test-account","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}')
+
+          HTTP_STATUS=$(echo "$RESPONSE" | tail -1)
+          kill $PF_PID
+
+          if [ "$HTTP_STATUS" != "202" ]; then
+            echo "::error::Event ingestion smoke test failed with HTTP $HTTP_STATUS"
+            echo "Response: $(echo "$RESPONSE" | head -1)"
+            exit 1
+          fi
+          echo "Smoke test passed"
+
+      - name: Check error rate in staging (Prometheus)
+        run: |
+          # Query staging Prometheus for error rate over last 2m
+          ERROR_RATE=$(curl -sG \
+            "http://prometheus.monitoring.svc.cluster.local:9090/api/v1/query" \
+            --data-urlencode 'query=rate(http_requests_total{service="event-ingestion-service",status=~"5.."}[2m]) / rate(http_requests_total{service="event-ingestion-service"}[2m]) * 100' \
+            | jq -r '.data.result[0].value[1] // "0"')
+
+          echo "Error rate in staging: ${ERROR_RATE}%"
+          if (( $(echo "$ERROR_RATE > 1" | bc -l) )); then
+            echo "::error::Error rate ${ERROR_RATE}% exceeds 1% threshold after deploy"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Manual approval gate before production
+  # ---------------------------------------------------------------------------
+  # This job exists as a gate only — production deployment is handled by a
+  # separate Argo Rollouts-based workflow (see docs/assessment-written.md §3a).
+  # ---------------------------------------------------------------------------
+  production-gate:
+    name: Production Approval Gate
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    environment:
+      name: production-gate  # Requires manual approval in GitHub Environments settings
+
+    steps:
+      - name: Approval granted — record promotion artifact
+        run: |
+          cat << EOF > promotion.json
+          {
+            "service": "${{ env.SERVICE_NAME }}",
+            "image": "${{ needs.resolve-image.outputs.full_image }}",
+            "commit": "${{ github.sha }}",
+            "approved_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "approved_by": "${{ github.actor }}",
+            "pipeline_run": "${{ github.run_id }}"
+          }
+          EOF
+          cat promotion.json
+
+      - name: Upload promotion artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: promotion-${{ github.sha }}
+          path: promotion.json
+          retention-days: 30
+
+      # Trigger the production canary rollout workflow
+      - name: Trigger production canary deploy
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'production-canary.yml',
+              ref: 'main',
+              inputs: {
+                image_tag: '${{ needs.resolve-image.outputs.image_tag }}',
+                commit_sha: '${{ github.sha }}'
+              }
+            })
